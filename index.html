@@ -818,6 +818,8 @@ main .backb{margin:0 auto 6px 0!important;padding:5px 14px 5px 10px!important;fo
 .rpbar{gap:6px!important}.rpseg button{padding:6px 10px!important;font-size:12.5px!important}.rpadd{padding:6px 11px!important;font-size:12.5px!important}
 .vkf{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}.vkf label{display:flex;flex-direction:column;gap:3px;font-size:11px;font-weight:700;flex:1 1 150px}.vkf select{font-size:14px;padding:8px 10px;border-radius:10px;border:1.5px solid #a5b4fc;font-weight:700}
 .vkb{display:inline-block;background:#4338ca;color:#fff;border-radius:999px;padding:2px 10px;font-weight:800;font-size:12px}
+/* v2.61 print: only the invoice area prints (hide top bar, menu, floating buttons) */
+@media print{body>*:not(#pr):not(script):not(style){display:none!important}#mbar,#nbk,nav,.pavtop,.aic,#aicw,.dsgb,.dsgw,#secbar,#accbar,#sellw,.sbbar,.backb{display:none!important}#pr{display:block!important;position:static!important}}
 </style>
 <div class="app"><nav id="nav"></nav><main id="main"><p style="padding:20px">Loading PK AI Billing… (if this text stays, the page script did not run)</p></main></div><div id="mod"><div id="mb"></div></div><div id="toast"></div><div id="pr"></div><div id="auth"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -4088,7 +4090,7 @@ const _vRollStrict=VW.roll;VW.roll=()=>_vRollStrict().replace(/<p class=mu>Use "
 const _rStrict=render;render=function(){_rStrict();if(!D||MYC)return;if(D.me!='Owner'&&D.me!='Admin')document.querySelectorAll('#nav a').forEach(a=>{if(/go\('(myo|myp)'\)/.test(a.getAttribute('onclick')||''))a.style.display='none'});document.querySelectorAll('#nav h4').forEach(x=>{const d=x.nextElementSibling;if(d&&d.classList.contains('gi')&&![...d.children].some(a=>a.style.display!='none'))x.style.display='none'})};
 
 /* ===== build label (so the running version can be checked) ===== */
-const APPN=260;const APPV=(APPN/100).toFixed(2);
+const APPN=261;const APPV=(APPN/100).toFixed(2);
 const _vProfV=VW.prof;VW.prof=()=>_vProfV().replace(/(<th[^>]*>Business<\/th><td>[\s\S]*?<\/td><\/tr>)/,`$1<tr><th style="width:42%;text-align:left">App version</th><td>${APPV}</td></tr>`);
 const _avV=authView;authView=function(...a){_avV(...a);const c=document.querySelector('#auth .au-card');if(c&&!$('appv'))c.insertAdjacentHTML('beforeend',`<p id=appv style="text-align:center;margin:10px 0 0;font-size:11px;opacity:.5">${APPV}</p>`)};
 
