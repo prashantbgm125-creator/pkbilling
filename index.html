@@ -1,4 +1,174 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><script src="cloud-config.js"></script><script src="cloud-ai.js"></script><link rel="manifest" href="manifest.webmanifest"><meta name="theme-color" content="#0f4c4a"><link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"></head><body><title>PK AI Billing</title>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><script>/* PK AI Billing cloud settings. The apiKey below is the public Firebase WEB key (it only identifies the project, it is not a secret).
+   The secret Anthropic key is NEVER here: it lives only in Google Secret Manager on the server. */
+window.PKCLOUD_CONFIG = {
+  apiKey: "AIzaSyDrKqbX_HsMBAwXXbQjqHR1e8wYTKcawD4",
+  projectId: "pk-ai-billing",
+  region: "asia-south1"
+};
+
+/* PK AI Billing: cloud AI for the web / Android / Windows / Mac / iOS builds.
+   Gives the app the same "sample" interface that claude.ai gives, but answers come from your own Firebase function,
+   so AI works for every user without a Claude login. Nothing happens until cloud-config.js is filled. */
+(function () {
+  var C = window.PKCLOUD_CONFIG;
+  if (!C || !C.apiKey || !C.projectId || /PASTE|YOUR_/i.test(C.apiKey + C.projectId)) {
+    window.PKCLOUD_STATE = { configured: false, why: !C ? 'cloud-config.js was not loaded (file missing on the website)' : 'cloud-config.js is not filled (still has placeholder values)' };
+    return;
+  }
+  window.PKCLOUD_STATE = { configured: true };
+  var URL_ = C.aiUrl || ('https://' + (C.region || 'asia-south1') + '-' + C.projectId + '.cloudfunctions.net/ai');
+  var TK = 'pkcl_tok', mem = null, pending = null, cache = {}, cacheKeys = [];
+
+  function err(code, msg) { var e = new Error(msg); e.code = code; return e; }
+  function lsGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+  /* anonymous Firebase sign-in over REST (no SDK); the function checks this token and counts usage per device */
+  async function doToken(force) {
+    var t = mem || lsGet(TK), r, j;
+    if (t && !force && t.exp > Date.now() + 120000) { mem = t; return t.id; }
+    if (t && t.ref) {
+      try {
+        r = await fetch('https://securetoken.googleapis.com/v1/token?key=' + encodeURIComponent(C.apiKey), {
+          method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(t.ref)
+        });
+        j = await r.json().catch(function () { return {}; });
+        if (r.ok && j.id_token) {
+          t = { id: j.id_token, ref: j.refresh_token || t.ref, exp: Date.now() + (+j.expires_in || 3600) * 1000 };
+          mem = t; lsSet(TK, t); return t.id;
+        }
+      } catch (e) { /* fall through to a fresh sign-in */ }
+    }
+    r = await fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + encodeURIComponent(C.apiKey), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"returnSecureToken":true}'
+    });
+    j = await r.json().catch(function () { return {}; });
+    if (!r.ok || !j.idToken) throw err('auth_failed', 'AI sign-in failed. In Firebase Console turn on Authentication > Sign-in method > Anonymous');
+    t = { id: j.idToken, ref: j.refreshToken, exp: Date.now() + (+j.expiresIn || 3600) * 1000 };
+    mem = t; lsSet(TK, t); return t.id;
+  }
+  function token(force) {
+    if (pending && !force) return pending;
+    var p = doToken(force).then(function (x) { pending = null; return x; }, function (e) { pending = null; throw e; });
+    pending = p; return p;
+  }
+
+  function b64(blob) {
+    return new Promise(function (ok, no) {
+      var fr = new FileReader();
+      fr.onload = function () { var s = String(fr.result || ''); ok(s.slice(s.indexOf(',') + 1)); };
+      fr.onerror = function () { no(err('bad_request', 'Could not read the image')); };
+      fr.readAsDataURL(blob);
+    });
+  }
+  /* phone photos are big: shrink to 1600 px JPEG before upload (also converts types the AI cannot read) */
+  function shrink(blob) {
+    return new Promise(function (ok) {
+      try {
+        var okType = /^image\/(jpeg|png|webp|gif)$/.test(blob.type || '');
+        if (okType && blob.size < 600000) return ok(blob);
+        var url = URL.createObjectURL(blob), im = new Image();
+        im.onload = function () {
+          try {
+            var k = Math.min(1, 1600 / Math.max(im.width, im.height)), c = document.createElement('canvas');
+            c.width = Math.max(1, Math.round(im.width * k)); c.height = Math.max(1, Math.round(im.height * k));
+            var x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(im, 0, 0, c.width, c.height);
+            URL.revokeObjectURL(url);
+            c.toBlob(function (b) { ok(b || blob); }, 'image/jpeg', 0.85);
+          } catch (e) { ok(blob); }
+        };
+        im.onerror = function () { URL.revokeObjectURL(url); ok(blob); };
+        im.src = url;
+      } catch (e) { ok(blob); }
+    });
+  }
+
+  async function call(msgs, opts) {
+    opts = opts || {};
+    var imgs = [], list = opts.images || [], i;
+    for (i = 0; i < list.length && i < 3; i++) {
+      var bl = await shrink(list[i]);
+      imgs.push({ media_type: bl.type || 'image/jpeg', data: await b64(bl) });
+    }
+    var tier = opts.modelTier === 'quick' || opts.modelTier === 'complex' ? opts.modelTier : 'default';
+    var payload = { messages: msgs, images: imgs, tier: tier };
+    if (opts.maxTokens) payload.maxTokens = opts.maxTokens;
+    var body = JSON.stringify(payload), ck = null;
+    if (opts.cache !== false && !imgs.length) {
+      ck = body; var hit = cache[ck];
+      if (hit && Date.now() - hit.t < 300000) return hit.v;
+    }
+    for (var attempt = 0; attempt < 2; attempt++) {
+      var tk = await token(attempt > 0), r;
+      var ac = new AbortController(), timedOut = false, onAbort = function () { ac.abort(); };
+      var tm = setTimeout(function () { timedOut = true; ac.abort(); }, opts.timeoutMs || 90000);
+      if (opts.signal) { if (opts.signal.aborted) ac.abort(); else opts.signal.addEventListener('abort', onAbort); }
+      try {
+        r = await fetch(URL_, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + tk }, body: body, signal: ac.signal });
+      } catch (e) {
+        if (timedOut) throw err('timeout', 'AI took too long to answer. Try again');
+        if (e && e.name === 'AbortError') throw err('aborted', 'Cancelled');
+        throw err('network', 'Could not reach the AI service. Check internet, or the AI server is not deployed yet');
+      } finally { clearTimeout(tm); if (opts.signal) opts.signal.removeEventListener('abort', onAbort); }
+      var j = await r.json().catch(function () { return {}; });
+      if (r.status === 401 && attempt === 0) continue; /* token expired: sign in again once */
+      if (!r.ok) throw err(j.code || (r.status === 429 ? 'rate_limited' : 'error'), j.message || ('AI error ' + r.status));
+      if (!j || typeof j.text !== 'string') throw err('bad_response', 'AI sent an unreadable answer. Try again');
+      var v = { text: j.text, truncated: !!j.truncated };
+      if (!v.text.trim()) throw err('empty_response', 'AI sent an empty answer. Try again');
+      if (ck) { cache[ck] = { t: Date.now(), v: v }; cacheKeys.push(ck); if (cacheKeys.length > 40) delete cache[cacheKeys.shift()]; }
+      return v;
+    }
+  }
+
+  function asMsgs(input) { return typeof input === 'string' ? [{ role: 'user', content: input }] : input; }
+
+  function parseJson(text) {
+    var s = String(text || '').replace(/```(?:json)?/gi, '').trim(), a = s.search(/[\[{]/);
+    if (a < 0) throw err('bad_json', 'AI did not return JSON');
+    var close = s[a] === '{' ? '}' : ']', b = s.lastIndexOf(close);
+    if (b < a) throw err('bad_json', 'AI did not return JSON');
+    try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { throw err('bad_json', 'AI did not return valid JSON'); }
+  }
+
+  var sample = async function (input, opts) {
+    var r = await call(asMsgs(input), opts);
+    if (opts && typeof opts.onText === 'function') { try { opts.onText({ text: r.text, delta: r.text }); } catch (e) {} }
+    return r;
+  };
+  sample.json = async function (input, opts) {
+    var msgs = asMsgs(input).map(function (m) { return { role: m.role, content: m.content }; });
+    msgs[msgs.length - 1].content += '\n\nReply with ONLY valid JSON. No markdown fences and no extra words.';
+    return parseJson((await call(msgs, opts)).text);
+  };
+  sample.limits = async function () { return { images: true }; };
+
+
+  /* step by step check used by My Profile > AI status. Returns [{k, ok, msg}] */
+  window.PKCLOUD_DIAG = async function () {
+    var out = [], h;
+    out.push({ k: 'Settings loaded (cloud-config.js)', ok: true, msg: 'Project ' + C.projectId });
+    try { await token(true); out.push({ k: 'Anonymous sign-in (Firebase Authentication)', ok: true, msg: 'Works' }); }
+    catch (e) { out.push({ k: 'Anonymous sign-in (Firebase Authentication)', ok: false, msg: e.message || 'Failed' }); return out; }
+    try {
+      var ac = new AbortController(), tm = setTimeout(function () { ac.abort(); }, 15000);
+      var r = await fetch(URL_ + '?health=1', { signal: ac.signal }); clearTimeout(tm);
+      h = await r.json();
+      out.push({ k: 'AI server is deployed', ok: true, msg: 'Reachable in region ' + (h.region || '') });
+      out.push({ k: 'Anthropic API key saved on the server', ok: !!h.keySet, msg: h.keySet ? 'Found' : 'Missing. Run: firebase functions:secrets:set ANTHROPIC_API_KEY, then deploy again' });
+      out.push({ k: 'Firestore database (daily limits)', ok: !!h.firestore, msg: h.firestore ? 'Found' : (h.hint || 'Create the Firestore database') });
+    } catch (e) { out.push({ k: 'AI server is deployed', ok: false, msg: 'Not reachable. Deploy the function (see AI setup steps) and check internet' }); return out; }
+    try { var t = await sample('Reply with the single word OK', { cache: false, maxTokens: 16, timeoutMs: 40000 }); out.push({ k: 'Live test with the AI', ok: true, msg: 'AI answered: ' + String(t.text).slice(0, 40) }); }
+    catch (e) { out.push({ k: 'Live test with the AI', ok: false, msg: e.message || 'Failed' }); }
+    return out;
+  };
+
+  window.PKCLOUD_SAMPLE = sample;
+  /* quick self-check from the browser console:  PKCLOUD_CHECK().then(console.log) */
+  window.PKCLOUD_CHECK = function () { return fetch(URL_ + '?health=1').then(function (r) { return r.json(); }); };
+})();
+</script><link rel="manifest" href="manifest.webmanifest"><meta name="theme-color" content="#0f4c4a"><link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"></head><body><title>PK AI Billing</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&family=Noto+Sans+Kannada:wght@400;600&display=swap">
 <style>
 :root{--bg:#f3f5f1;--sf:#fff;--tx:#14262a;--mu:#5d6f72;--ln:#dce3df;--pr:#0f4c4a;--pt:#fff;--ac:#e0a21b;--ok:#1f7a4d;--bad:#b3392f;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -820,6 +990,12 @@ main .backb{margin:0 auto 6px 0!important;padding:5px 14px 5px 10px!important;fo
 .vkb{display:inline-block;background:#4338ca;color:#fff;border-radius:999px;padding:2px 10px;font-weight:800;font-size:12px}
 /* v2.61 print: only the invoice area prints (hide top bar, menu, floating buttons) */
 @media print{body>*:not(#pr):not(script):not(style){display:none!important}#mbar,#nbk,nav,.pavtop,.aic,#aicw,.dsgb,.dsgw,#secbar,#accbar,#sellw,.sbbar,.backb{display:none!important}#pr{display:block!important;position:static!important}}
+/* v2.62 modal preview of a4 notes must not scroll sideways or be clipped */
+#mb .sc:has(.inv.a4){overflow-x:hidden}
+@media print{html,body{background:#fff!important}}
+/* v2.63 AI working indicator */
+#aiwk{display:none;position:fixed;top:calc(10px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);z-index:10070;align-items:center;gap:8px;background:#14234a;color:#fff;border-radius:999px;padding:7px 14px;font-size:13px;font-weight:700;box-shadow:0 6px 18px rgba(0,0,0,.3)}
+#aiwk i{width:14px;height:14px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:aiws .8s linear infinite}@keyframes aiws{to{transform:rotate(360deg)}}
 </style>
 <div class="app"><nav id="nav"></nav><main id="main"><p style="padding:20px">Loading PK AI Billing… (if this text stays, the page script did not run)</p></main></div><div id="mod"><div id="mb"></div></div><div id="toast"></div><div id="pr"></div><div id="auth"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -4090,7 +4266,7 @@ const _vRollStrict=VW.roll;VW.roll=()=>_vRollStrict().replace(/<p class=mu>Use "
 const _rStrict=render;render=function(){_rStrict();if(!D||MYC)return;if(D.me!='Owner'&&D.me!='Admin')document.querySelectorAll('#nav a').forEach(a=>{if(/go\('(myo|myp)'\)/.test(a.getAttribute('onclick')||''))a.style.display='none'});document.querySelectorAll('#nav h4').forEach(x=>{const d=x.nextElementSibling;if(d&&d.classList.contains('gi')&&![...d.children].some(a=>a.style.display!='none'))x.style.display='none'})};
 
 /* ===== build label (so the running version can be checked) ===== */
-const APPN=261;const APPV=(APPN/100).toFixed(2);
+const APPN=263;const APPV=(APPN/100).toFixed(2);
 const _vProfV=VW.prof;VW.prof=()=>_vProfV().replace(/(<th[^>]*>Business<\/th><td>[\s\S]*?<\/td><\/tr>)/,`$1<tr><th style="width:42%;text-align:left">App version</th><td>${APPV}</td></tr>`);
 const _avV=authView;authView=function(...a){_avV(...a);const c=document.querySelector('#auth .au-card');if(c&&!$('appv'))c.insertAdjacentHTML('beforeend',`<p id=appv style="text-align:center;margin:10px 0 0;font-size:11px;opacity:.5">${APPV}</p>`)};
 
@@ -5499,6 +5675,26 @@ async function clAdmOpen(i){const s=CL.adm[i];if(!s||!sellerOK())return;try{cons
   sellClose();save();enter(a);T('Opened as support: '+(s.name||s.id))}catch(e){T(clErr(e))}}
 
 document.head.insertAdjacentHTML('beforeend','<style>#mod{z-index:10050!important}#toast{z-index:10060!important}</style>');
+
+/* ===== v2.62: A4 notes (debit note etc.) shrink to fit the phone preview ===== */
+function fitA4(){const mb=document.getElementById('mb');if(!mb)return;mb.querySelectorAll('.inv.a4').forEach(el=>{if(el.closest('#pr'))return;const host=el.parentElement;el.style.zoom='';const w=Math.max(el.offsetWidth,720),aw=(host?host.clientWidth:w)-2;const z=aw>0?Math.min(1,aw/w):1;el.style.zoom=z<1?z.toFixed(3):'';if(z<1){el.style.width='720px';el.style.maxWidth='none';el.style.margin='0'}})}
+(function(){const mb=document.getElementById('mb');if(!mb||window.__fa4)return;window.__fa4=1;let busy=0;new MutationObserver(()=>{if(busy)return;busy=1;setTimeout(()=>{try{fitA4()}catch(e){}busy=0},30)}).observe(mb,{childList:true,subtree:true});window.addEventListener('resize',()=>{try{fitA4()}catch(e){}})})();
+
+/* ===== v2.63: AI connection: working indicator, clear reason when AI is off, AI status check in My Profile ===== */
+let AIPEND=0,AINOTE=0;const AIWRAP=new WeakMap();
+function aiBusy(d){AIPEND=Math.max(0,AIPEND+d);let e=document.getElementById('aiwk');if(!e){e=document.createElement('div');e.id='aiwk';e.innerHTML='<i></i>AI is working…';document.body.appendChild(e)}e.style.display=AIPEND>0?'flex':'none'}
+function aiTrack(s){if(!s||typeof s!='function')return s;if(AIWRAP.has(s))return AIWRAP.get(s);const run=async(f,a)=>{aiBusy(1);try{return await f(...a)}finally{aiBusy(-1)}};const w=function(...a){return run(s,a)};['json','limits'].forEach(k=>{if(typeof s[k]=='function')w[k]=function(...a){return run(s[k].bind(s),a)}});Object.keys(s).forEach(k=>{if(!(k in w))w[k]=s[k]});AIWRAP.set(s,w);return w}
+const _gs263=getSample;getSample=async function(){const s=await _gs263();if(s)return aiTrack(s);
+ const st=window.PKCLOUD_STATE;if(Date.now()-AINOTE>15000){AINOTE=Date.now();T('AI is not connected. '+(st&&st.why?st.why+'. ':'')+'Owner: My Profile > AI status shows what to fix')}return s};
+async function aiDiag(){M(`<div class=pw><h3>AI status</h3><p class=mu style="margin-top:0">Checking the AI connection…</p><div id=aidg></div><div class=bt><button class=g onclick=closeM()>Close</button></div></div>`);
+ const box=()=>document.getElementById('aidg');let rows=[];
+ try{if(typeof claude!='undefined'&&claude.use){try{const s=await claude.use('sample');if(s)rows=[{k:'Running inside Claude',ok:true,msg:'AI uses Claude directly. No setup needed here.'}]}catch(e){}}
+  if(!rows.length){if(!window.PKCLOUD_DIAG)rows=[{k:'Settings loaded (cloud-config.js)',ok:false,msg:(window.PKCLOUD_STATE&&window.PKCLOUD_STATE.why)||'AI files are missing from the website. Upload the latest index.html'}];else rows=await window.PKCLOUD_DIAG()}}
+ catch(e){rows=[{k:'Check failed',ok:false,msg:String(e&&e.message||e)}]}
+ const b=box();if(!b)return;const bad=rows.filter(r=>!r.ok).length;
+ b.innerHTML=rows.map(r=>`<div style="display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--ln)"><b style="color:${r.ok?'#1f7a4d':'#b91c1c'}">${r.ok?'✔':'✖'}</b><div><b>${esc(r.k)}</b><br><span class=mu>${esc(r.msg)}</span></div></div>`).join('')+`<p style="margin:10px 0 0;font-weight:700;color:${bad?'#b91c1c':'#1f7a4d'}">${bad?'AI is not ready. Fix the red item first.':'AI is ready.'}</p>`;
+ const h=document.querySelector('#mb .pw>p.mu');if(h)h.remove()}
+const _vProf263=VW.prof;VW.prof=()=>{const h=_vProf263();return h+(typeof isOA=='function'&&isOA()?`<div class=card><h3 style="margin-top:0">AI status</h3><p class=mu style="margin-top:0">If AI Assistant, invoice scan or Kannada names do not work, check here.</p><div class=bt><button onclick="aiDiag()">Check AI connection</button></div></div>`:'')};
 
 boot();
 </script>
